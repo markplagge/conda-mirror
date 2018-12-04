@@ -11,6 +11,8 @@ import shutil
 import sys
 import tarfile
 import tempfile
+from concurrent.futures import ProcessPoolExecutor as exe
+from concurrent.futures import as_completed
 from pprint import pformat
 
 import requests
@@ -530,6 +532,28 @@ def _validate_or_remove_package(args):
                      size=package_metadata.get('size'))
 
 
+def tp_download(url, dest_folder):
+    return _download(url, dest_folder), url
+
+
+def multi_download(url_list, destination_folder, num_threads=20):
+    results = []
+
+    with exe(max_workers=num_threads) as executor:
+        for url in url_list:
+            future = executor.submit(tp_download, url, destination_folder)
+            results.append(future)
+
+    for r in as_completed(results):
+        yield r.result()
+
+
+
+
+
+
+
+
 def main(upstream_channel, target_directory, temp_directory, platform,
          blacklist=None, whitelist=None, num_threads=1, dry_run=False,
          no_validate_target=False, minimum_free_space=0):
@@ -711,32 +735,54 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     download_url, channel = _maybe_split_channel(upstream_channel)
     with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
         logger.info('downloading to the tempdir %s', download_dir)
+
+        url_list = []
         for package_name in sorted(to_mirror):
             url = download_url.format(
                 channel=channel,
                 platform=platform,
                 file_name=package_name)
-            try:
-                # make sure we have enough free disk space in the temp folder to meet threshold
-                if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download.',
-                                 download_dir)
-                    break
+            url_list.append(url)
+        if num_threads == 0 | num_threads == None:
+            num_threads = multiprocessing.cpu_count()
 
-                # download package
-                total_bytes += _download(url, download_dir)
+        for tb in multi_download(url_list, download_dir, num_threads):
+            total_bytes += tb[0]
 
-                # make sure we have enough free disk space in the target folder to meet threshold
-                # while also being able to fit the packages we have already downloaded
-                if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download',
-                                 local_directory)
-                    break
-
-                summary['downloaded'].add((url, download_dir))
-            except Exception as ex:
-                logger.exception('Unexpected error: %s. Aborting download.', ex)
+            if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
+                logger.error('Disk space below threshold in %s. Aborting download',
+                             local_directory)
                 break
+            summary['downloaded'].add((tb[1], download_dir))
+
+        # for package_name in sorted(to_mirror):
+        #     url = download_url.format(
+        #         channel=channel,
+        #         platform=platform,
+        #         file_name=package_name)
+        #     try:
+        #         # make sure we have enough free disk space in the temp folder to meet threshold
+        #         if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
+        #             logger.error('Disk space below threshold in %s. Aborting download.',
+        #                          download_dir)
+        #             break
+        #
+        #         # download package
+        #         total_bytes += _download(url, download_dir)
+        #
+        #         # make sure we have enough free disk space in the target folder to meet threshold
+        #         # while also being able to fit the packages we have already downloaded
+        #         if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
+        #             logger.error('Disk space below threshold in %s. Aborting download',
+        #                          local_directory)
+        #             break
+        #
+        #         summary['downloaded'].add((url, download_dir))
+        #     except Exception as ex:
+        #         logger.exception('Unexpected error: %s. Aborting download.', ex)
+        #         break
+
+        #####
 
         # validate all packages in the download directory
         validation_results = _validate_packages(packages, download_dir,
